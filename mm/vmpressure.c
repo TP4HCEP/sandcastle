@@ -330,63 +330,37 @@ static void vmpressure_memcg(gfp_t gfp, struct mem_cgroup *memcg, bool tree,
 	}
 }
 #else
-static void vmpressure_memcg(gfp_t gfp, struct mem_cgroup *memcg, bool tree,
-		unsigned long scanned, unsigned long reclaimed) { }
+static void vmpressure_memcg(gfp_t gfp, struct mem_cgroup *memcg, bool critical,
+			     bool tree, unsigned long scanned,
+			     unsigned long reclaimed) { }
 #endif
 
-static void calculate_vmpressure_win(void)
-{
-	long x;
-
-	x = global_node_page_state(NR_FILE_PAGES) -
-			global_node_page_state(NR_SHMEM) -
-			total_swapcache_pages() +
-			global_page_state(NR_FREE_PAGES);
-	if (x < 1)
-		x = 1;
-	/*
-	 * For low (free + cached), vmpressure window should be
-	 * small, and high for higher values of (free + cached).
-	 * But it should not be linear as well. This ensures
-	 * timely vmpressure notifications when system is under
-	 * memory pressure, and optimal number of events when
-	 * cached is high. The sqaure root function is empirically
-	 * found to serve the purpose.
-	 */
-	x = int_sqrt(x);
-	vmpressure_win = x;
-}
-
-static void vmpressure_global(gfp_t gfp, unsigned long scanned,
-		unsigned long reclaimed)
+static void vmpressure_global(gfp_t gfp, unsigned long scanned, bool critical,
+			      unsigned long reclaimed)
 {
 	struct vmpressure *vmpr = &global_vmpressure;
 	unsigned long pressure;
 	unsigned long stall;
 
-	if (!(gfp & (__GFP_HIGHMEM | __GFP_MOVABLE | __GFP_IO | __GFP_FS)))
-		return;
+	if (critical)
+		scanned = calculate_vmpressure_win();
 
-	if (!scanned)
-		return;
+	if (scanned) {
+		spin_lock(&vmpr->sr_lock);
+		vmpr->scanned += scanned;
+		vmpr->reclaimed += reclaimed;
 
-	spin_lock(&vmpr->sr_lock);
-	if (!vmpr->scanned)
-		calculate_vmpressure_win();
+		if (!current_is_kswapd())
+			vmpr->stall += scanned;
 
-	vmpr->scanned += scanned;
-	vmpr->reclaimed += reclaimed;
+		stall = vmpr->stall;
+		scanned = vmpr->scanned;
+		reclaimed = vmpr->reclaimed;
+		spin_unlock(&vmpr->sr_lock);
 
-	if (!current_is_kswapd())
-		vmpr->stall += scanned;
-
-	stall = vmpr->stall;
-	scanned = vmpr->scanned;
-	reclaimed = vmpr->reclaimed;
-	spin_unlock(&vmpr->sr_lock);
-
-	if (scanned < vmpressure_win)
-		return;
+		if (!critical && scanned < calculate_vmpressure_win())
+			return;
+	}
 
 	spin_lock(&vmpr->sr_lock);
 	vmpr->scanned = 0;
@@ -394,9 +368,24 @@ static void vmpressure_global(gfp_t gfp, unsigned long scanned,
 	vmpr->stall = 0;
 	spin_unlock(&vmpr->sr_lock);
 
-	pressure = vmpressure_calc_pressure(scanned, reclaimed);
-	pressure = vmpressure_account_stall(pressure, stall, scanned);
+	if (scanned) {
+		pressure = vmpressure_calc_pressure(scanned, reclaimed);
+		pressure = vmpressure_account_stall(pressure, stall, scanned);
+	} else {
+		pressure = 100;
+	}
 	vmpressure_notify(pressure);
+}
+
+static void __vmpressure(gfp_t gfp, struct mem_cgroup *memcg, bool critical,
+			 bool tree, unsigned long scanned,
+			 unsigned long reclaimed)
+{
+	if (!memcg && tree)
+		vmpressure_global(gfp, scanned, critical, reclaimed);
+
+	if (IS_ENABLED(CONFIG_MEMCG))
+		vmpressure_memcg(gfp, memcg, critical, tree, scanned, reclaimed);
 }
 
 /**
@@ -423,11 +412,7 @@ static void vmpressure_global(gfp_t gfp, unsigned long scanned,
 void vmpressure(gfp_t gfp, struct mem_cgroup *memcg, bool tree,
 		unsigned long scanned, unsigned long reclaimed)
 {
-	if (!memcg && tree)
-		vmpressure_global(gfp, scanned, reclaimed);
-
-	if (IS_ENABLED(CONFIG_MEMCG))
-		vmpressure_memcg(gfp, memcg, tree, scanned, reclaimed);
+	__vmpressure(gfp, memcg, false, tree, scanned, reclaimed);
 }
 
 /**
