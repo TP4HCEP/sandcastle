@@ -337,6 +337,7 @@ static void vmpressure_memcg(gfp_t gfp, struct mem_cgroup *memcg, bool critical,
 
 static void vmpressure_global(gfp_t gfp, unsigned long scanned, bool critical,
 			      unsigned long reclaimed)
+
 {
 	struct vmpressure *vmpr = &global_vmpressure;
 	unsigned long pressure;
